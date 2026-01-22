@@ -14,14 +14,12 @@ on:
   workflow_dispatch:
     inputs: 
       ksu_type:
-        description: 'KernelSU分支(Wild_KSU/SukiSU Ultra/ReSukiSU/KernelSU Next/MKSU/KSU(原版)/无内置KSU,默认Wild_KSU)'
+        description: 'KernelSU分支(Wild_KSU/KernelSU Next/MKSU/KSU(原版)/无内置KSU,默认Wild_KSU)'
         required: true
         type: choice
         default: 'wildksu'
         options: 
           - 'wildksu'
-          - 'sukisu'
-          - 'resukisu'
           - 'ksunext'
           - 'mksu'
           - 'ksu'
@@ -102,6 +100,15 @@ on:
         options: 
           - 'O2'
           - 'O3'
+      lto_mode:
+        description: 'LTO优化(none/thin/full)'
+        required: true
+        type: choice
+        default: 'none'
+        options:
+          - 'none'
+          - 'thin'
+          - 'full'
       clean_build:
         description: '是否清空编译缓存(ccache)'
         required: true
@@ -157,12 +164,41 @@ jobs:
           set -euo pipefail
           echo "::group::安装依赖"
           sudo apt-get -o Acquire::Retries=3 update -qq
+          # 全量升级系统包，减少因版本过旧导致的编译异常
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -y full-upgrade
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             git curl ca-certificates build-essential clang lld flex bison \
             libelf-dev libssl-dev libncurses-dev zlib1g-dev liblz4-tool \
-            libxml2-utils rsync unzip dwarves file python3 ccache jq bc dos2unix kmod libdw-dev elfutils
+            libxml2-utils rsync unzip dwarves file python3 ccache jq bc dos2unix kmod libdw-dev elfutils cmake
           sudo apt-get clean
           echo "✅ 依赖安装完成"
+          echo "::endgroup::"
+
+      - name: 🧰 安装/升级 pahole (dwarves v1.31)
+        run: |
+          set -euo pipefail
+          echo "::group::pahole"
+          REQUIRED="1.31"
+          CURRENT=""
+          
+          if command -v pahole >/dev/null 2>&1; then
+            CURRENT=$(pahole --version | awk '{for (i=1; i<=NF; i++) if ($i ~ /^[0-9]+\\.[0-9]+/) {print $i; exit}}')
+          fi
+          
+          if [ -z "$CURRENT" ] || [ "$(printf '%s\n' "$REQUIRED" "$CURRENT" | sort -V | head -n1)" != "$REQUIRED" ]; then
+            echo "Building dwarves v$REQUIRED..."
+            rm -rf "$GITHUB_WORKSPACE/dwarves"
+            git clone --depth=1 --branch "v$REQUIRED" https://github.com/acmel/dwarves.git "$GITHUB_WORKSPACE/dwarves"
+            cmake -S "$GITHUB_WORKSPACE/dwarves" -B "$GITHUB_WORKSPACE/dwarves/build" -DCMAKE_BUILD_TYPE=Release
+            cmake --build "$GITHUB_WORKSPACE/dwarves/build" -j"$(nproc --all)"
+            echo "$GITHUB_WORKSPACE/dwarves/build" >> "$GITHUB_PATH"
+            echo "PAHOLE=$GITHUB_WORKSPACE/dwarves/build/pahole" >> "$GITHUB_ENV"
+            export PATH="$GITHUB_WORKSPACE/dwarves/build:$PATH"
+          else
+            echo "Using system pahole $CURRENT"
+          fi
+          
+          pahole --version
           echo "::endgroup::"
 
       - name: 💾 磁盘使用预构建检查
@@ -195,35 +231,40 @@ jobs:
           
           sudo apt-mark hold firefox &&
           sudo apt-mark hold libc-bin &&
-          sudo apt purge man-db &&
+          sudo apt purge -y man-db &&
           sudo rm -rf /var/lib/man-db/auto-update &&
           sudo apt update &&
+          # 全量升级系统包，减少因版本过旧导致的编译异常
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -y full-upgrade &&
           if ! command -v aria2c >/dev/null 2>&1; then
             sudo apt-get install -y --no-install-recommends aria2
           fi
-          sudo apt-get install -y --no-install-recommends binutils python-is-python3 libssl-dev libelf-dev ccache &
+          sudo apt-get install -y --no-install-recommends binutils python-is-python3 libssl-dev libelf-dev ccache
           
-          echo "正在克隆源码仓库..."
-          # 原实现：并发下载+解压 common，失败时容易被忽略
-          # aria2c -s16 -x16 -k1M https://github.com/cctv18/android_kernel_common_oneplus_sm8750/archive/refs/heads/oneplus/sm8750_v_15.0.2_oneplus_13_6.6.66.zip -o common.zip && 
-          # unzip -q common.zip && 
-          # mv "android_kernel_common_oneplus_sm8750-oneplus-sm8750_v_15.0.2_oneplus_13_6.6.66" common &&
-          # rm -rf common.zip &
-          
-          # 新实现：顺序执行并校验 common 目录与关键文件，避免后续 sed 找不到文件
-          aria2c -s16 -x16 -k1M https://github.com/cctv18/android_kernel_common_oneplus_sm8750/archive/refs/heads/oneplus/sm8750_v_15.0.2_oneplus_13_6.6.66.zip -o common.zip
-          unzip -q common.zip
-          COMMON_DIR=$(ls -d android_kernel_common_oneplus_sm8750-* 2>/dev/null | head -n1)
-          if [ -z "$COMMON_DIR" ]; then
-            echo "❌ common 解压失败，未找到源码目录"
-            ls -la
-            exit 1
+          echo "正在初始化OnePlus内核仓库..."
+          REPO=/usr/local/bin/repo
+          if [ ! -x "$REPO" ]; then
+            sudo curl -L https://storage.googleapis.com/git-repo-downloads/repo -o "$REPO"
+            sudo chmod +x "$REPO"
           fi
-          mv "$COMMON_DIR" common
-          rm -rf common.zip
-          if [ ! -f common/scripts/setlocalversion ]; then
-            echo "❌ common/scripts/setlocalversion 不存在"
-            ls -la common/scripts || true
+          
+          "$REPO" init -u https://github.com/OnePlusOSS/kernel_manifest.git -b oneplus/sm8750 -m oneplus_ace_6.xml --repo-rev=v2.16 --depth=1 --no-clone-bundle --no-tags
+          "$REPO" --version
+          
+          success=false
+          for i in 1 2 3; do
+            if "$REPO" sync -c --no-clone-bundle --no-tags --optimized-fetch -j"$(nproc --all)" --fail-fast; then
+              success=true
+              break
+            fi
+            echo "⚠️ repo sync attempt $i failed; retrying..."
+            sleep 30
+          done
+          $success || { echo "❌ repo sync failed"; exit 1; }
+          
+          if [ ! -f kernel_platform/common/scripts/setlocalversion ]; then
+            echo "❌ kernel_platform/common/scripts/setlocalversion 不存在"
+            ls -la kernel_platform/common/scripts || true
             exit 1
           fi
           
@@ -243,10 +284,18 @@ jobs:
           echo "::endgroup::"
           
           echo "::group::移除ABI保护和dirty标记"
-          rm common/android/abi_gki_protected_exports_* || true
-          for f in common/scripts/setlocalversion; do
-            sed -i 's/ -dirty//g' "$f"
-            sed -i '$i res=$(echo "$res" | sed '\''s/-dirty//g'\'')' "$f"
+          rm kernel_platform/common/android/abi_gki_protected_exports_* || true
+          rm kernel_platform/msm-kernel/android/abi_gki_protected_exports_* || true
+          for f in \
+            kernel_platform/common/scripts/setlocalversion \
+            kernel_platform/msm-kernel/scripts/setlocalversion \
+            kernel_platform/external/dtc/scripts/setlocalversion; do
+            if [ -f "$f" ]; then
+              sed -i 's/ -dirty//g' "$f"
+              sed -i '$i res=$(echo "$res" | sed '\''s/-dirty//g'\'')' "$f"
+            else
+              echo "⚠️ $f 不存在，跳过"
+            fi
           done
           echo "::endgroup::"
 
@@ -292,7 +341,7 @@ jobs:
       - name: 🔌 添加KernelSU
         id: ksu_version
         run: |
-          cd kernel_workspace
+          cd kernel_workspace/kernel_platform
           
           if [[ ${{ github.event.inputs.ksu_type }} == "wildksu" ]]; then
             echo "正在配置 Wild_KSU..."
@@ -311,25 +360,6 @@ jobs:
             sed -i "s/DKSU_VERSION=16/DKSU_VERSION=${KSU_VERSION}/" kernel/Kbuild || true
             
             echo "Wild_KSU版本号:  v${KSU_VERSION}-${GIT_COMMIT_HASH}@WildKernels"
-            
-          elif [[ ${{ github.event.inputs.ksu_type }} == "sukisu" ]]; then
-            echo "正在配置SukiSU Ultra..."
-            curl -LSs "https://raw.githubusercontent.com/ShirkNeko/SukiSU-Ultra/refs/heads/main/kernel/setup.sh" | bash -s builtin
-            cd ./KernelSU
-            GIT_COMMIT_HASH=$(git rev-parse --short=8 HEAD)
-            
-            KSU_VERSION=$(expr $(git rev-list --count main) + 37185 2>/dev/null || echo 114514)
-            echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
-            echo "ksuver=$KSU_VERSION" >> $GITHUB_OUTPUT
-            
-          elif [[ ${{ github.event.inputs.ksu_type }} == "resukisu" ]]; then
-            echo "正在配置ReSukiSU..."
-            curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/refs/heads/main/kernel/setup.sh" | bash -s builtin
-            cd ./KernelSU
-            
-            KSU_VERSION=$(expr $(git rev-list --count main) + 30700 2>/dev/null || echo 114514)
-            echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
-            echo "ksuver=$KSU_VERSION" >> $GITHUB_OUTPUT
             
           elif [[ ${{ github.event.inputs.ksu_type }} == "ksunext" ]]; then
             echo "正在配置KernelSU Next..."
@@ -371,13 +401,13 @@ jobs:
           echo "::group::应用SUSFS补丁"
 
           git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}
-          wget https://github.com/cctv18/oppo_oplus_realme_sm8750/raw/refs/heads/main/other_patch/69_hide_stuff.patch -O ./common/69_hide_stuff.patch
+          wget https://github.com/cctv18/oppo_oplus_realme_sm8750/raw/refs/heads/main/other_patch/69_hide_stuff.patch -O ./kernel_platform/common/69_hide_stuff.patch
 
-          cp ./susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch ./common/
-          cp ./susfs4ksu/kernel_patches/fs/* ./common/fs/ 2>/dev/null || true
-          cp ./susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/ 2>/dev/null || true
+          cp ./susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch ./kernel_platform/common/
+          cp ./susfs4ksu/kernel_patches/fs/* ./kernel_platform/common/fs/ 2>/dev/null || true
+          cp ./susfs4ksu/kernel_patches/include/linux/* ./kernel_platform/common/include/linux/ 2>/dev/null || true
 
-          cd ./common
+          cd ./kernel_platform/common
           patch -p1 < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch || true
           patch -p1 < 69_hide_stuff.patch || true
 
@@ -391,11 +421,11 @@ jobs:
           cd kernel_workspace
           
           git clone --depth=1 https://github.com/cctv18/oppo_oplus_realme_sm8750.git
-          cp ./oppo_oplus_realme_sm8750/zram_patch/001-lz4.patch ./common/
-          cp ./oppo_oplus_realme_sm8750/zram_patch/lz4armv8.S ./common/lib
-          cp ./oppo_oplus_realme_sm8750/zram_patch/002-zstd.patch ./common/
+          cp ./oppo_oplus_realme_sm8750/zram_patch/001-lz4.patch ./kernel_platform/common/
+          cp ./oppo_oplus_realme_sm8750/zram_patch/lz4armv8.S ./kernel_platform/common/lib
+          cp ./oppo_oplus_realme_sm8750/zram_patch/002-zstd.patch ./kernel_platform/common/
           
-          cd ./common
+          cd ./kernel_platform/common
           git apply -p1 < 001-lz4.patch || true
           patch -p1 < 002-zstd.patch || true
           
@@ -408,15 +438,16 @@ jobs:
           echo "::group::应用LZ4KD补丁"
           cd kernel_workspace
           
-          if [ !  -d "SukiSU_patch" ]; then
-            git clone --depth=1 https://github.com/ShirkNeko/SukiSU_patch.git
+          PATCH_REPO="Wild_KSU_patch"
+          if [ ! -d "$PATCH_REPO" ]; then
+            git clone --depth=1 https://github.com/ShirkNeko/SukiSU_patch.git "$PATCH_REPO"
           fi
           
-          cd common
-          cp -r ../SukiSU_patch/other/zram/lz4k/include/linux/* ./include/linux/
-          cp -r ../SukiSU_patch/other/zram/lz4k/lib/* ./lib
-          cp -r ../SukiSU_patch/other/zram/lz4k/crypto/* ./crypto
-          cp ../SukiSU_patch/other/zram/zram_patch/${{ env.KERNEL_VERSION }}/lz4kd.patch ./
+          cd kernel_platform/common
+          cp -r "../../$PATCH_REPO/other/zram/lz4k/include/linux/"* ./include/linux/
+          cp -r "../../$PATCH_REPO/other/zram/lz4k/lib/"* ./lib
+          cp -r "../../$PATCH_REPO/other/zram/lz4k/crypto/"* ./crypto
+          cp "../../$PATCH_REPO/other/zram/zram_patch/${{ env.KERNEL_VERSION }}/lz4kd.patch" ./
           patch -p1 -F 3 < lz4kd.patch || true
           
           echo "✅ LZ4KD补丁应用完成"
@@ -428,17 +459,18 @@ jobs:
           echo "::group::应用LZ4K_OPLUS超级优化补丁"
           cd kernel_workspace
           
-          if [ ! -d "SukiSU_patch" ]; then
-            git clone --depth=1 https://github.com/ShirkNeko/SukiSU_patch.git
+          PATCH_REPO="Wild_KSU_patch"
+          if [ ! -d "$PATCH_REPO" ]; then
+            git clone --depth=1 https://github.com/ShirkNeko/SukiSU_patch.git "$PATCH_REPO"
           fi
           
-          cd common
-          cp -r ../SukiSU_patch/other/zram/lz4k/include/linux/* ./include/linux/ 2>/dev/null || true
-          cp -r ../SukiSU_patch/other/zram/lz4k/lib/* ./lib 2>/dev/null || true
-          cp -r ../SukiSU_patch/other/zram/lz4k/crypto/* ./crypto 2>/dev/null || true
-          cp -r ../SukiSU_patch/other/zram/lz4k_oplus ./lib 2>/dev/null || true
+          cd kernel_platform/common
+          cp -r "../../$PATCH_REPO/other/zram/lz4k/include/linux/"* ./include/linux/ 2>/dev/null || true
+          cp -r "../../$PATCH_REPO/other/zram/lz4k/lib/"* ./lib 2>/dev/null || true
+          cp -r "../../$PATCH_REPO/other/zram/lz4k/crypto/"* ./crypto 2>/dev/null || true
+          cp -r "../../$PATCH_REPO/other/zram/lz4k_oplus" ./lib 2>/dev/null || true
           
-          PATCH_FILE="../SukiSU_patch/other/zram/zram_patch/${{ env.KERNEL_VERSION }}/lz4k_oplus.patch"
+          PATCH_FILE="../../$PATCH_REPO/other/zram/zram_patch/${{ env.KERNEL_VERSION }}/lz4k_oplus.patch"
           if [ -f "$PATCH_FILE" ]; then
             patch -p1 -F 3 < "$PATCH_FILE" || echo "⚠️ lz4k_oplus补丁应用失败或已应用"
           else
@@ -455,10 +487,10 @@ jobs:
           cd kernel_workspace
 
           git clone https://github.com/HanKuCha/sched_ext.git
-          cp -r ./sched_ext/* ./common/kernel/sched
+          cp -r ./sched_ext/* ./kernel_platform/common/kernel/sched
           rm -rf ./sched_ext/.git
 
-          cd ./common/kernel/sched
+          cd ./kernel_platform/common/kernel/sched
 
           [ -f Kconfig ] || touch Kconfig
           if ! grep -q SCHED_CLASS_EXT Kconfig; then
@@ -491,21 +523,21 @@ jobs:
           cd kernel_workspace
           echo "::group::添加SUSFS配置"
 
-          echo "CONFIG_KSU_SUSFS=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_SUS_MAP=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_SUS_MAP=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
 
           echo "✅ SUSFS配置添加完成"
           echo "::endgroup::"
@@ -515,54 +547,85 @@ jobs:
           cd kernel_workspace
           echo "::group::添加内核配置项"
           
-          echo "CONFIG_KSU=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
           
           if [[ "${{ github.event.inputs.kpm_enable }}" == "builtin" && "${{ github.event.inputs.ksu_type }}" == "wildksu" ]]; then
-            echo "CONFIG_KPM=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_KPM=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
           fi
 
           if [[ "${{ github.event.inputs.susfs_enable }}" == "false" ]]; then
-            echo "CONFIG_KSU_SUSFS=n" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_KSU_SUSFS=n" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
           fi
           
-          echo "CONFIG_TMPFS_XATTR=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_TMPFS_POSIX_ACL=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_TMPFS_XATTR=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_TMPFS_POSIX_ACL=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
           
           # ZRAM配置
           if [[ "${{ github.event.inputs.lz4kd_enable }}" == "true" || "${{ github.event.inputs.zram_lz4k_oplus }}" == "true" ]]; then
-            echo "CONFIG_ZSMALLOC=y" >> ./common/arch/arm64/configs/gki_defconfig
-            echo "CONFIG_CRYPTO_LZ4HC=y" >> ./common/arch/arm64/configs/gki_defconfig
-            echo "CONFIG_CRYPTO_LZ4K=y" >> ./common/arch/arm64/configs/gki_defconfig
-            echo "CONFIG_CRYPTO_LZ4KD=y" >> ./common/arch/arm64/configs/gki_defconfig
-            echo "CONFIG_CRYPTO_842=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_ZSMALLOC=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_CRYPTO_LZ4HC=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_CRYPTO_LZ4K=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_CRYPTO_LZ4KD=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_CRYPTO_842=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
           fi
 
           if [[ "${{ github.event.inputs.zram_lz4k_oplus }}" == "true" ]]; then
-            echo "CONFIG_CRYPTO_LZ4K_OPLUS=y" >> ./common/arch/arm64/configs/gki_defconfig
-            echo "CONFIG_ZRAM_WRITEBACK=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_CRYPTO_LZ4K_OPLUS=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_ZRAM_WRITEBACK=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
           fi
           
           # SCX配置
           if [[ "${{ github.event.inputs.scx_enable }}" == "true" ]]; then
-            echo "CONFIG_SCHED_CLASS_EXT=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_SCHED_CLASS_EXT=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
           fi
           
           # HMBIRD配置
           if [[ "${{ github.event.inputs.hmbird_enable }}" == "true" ]]; then
-            echo "CONFIG_HMBIRD=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_HMBIRD=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
           fi
 
           # 优化编译
           if [[ "${{ github.event.inputs.optimize_level }}" == "O3" ]]; then
-            echo "CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
           else
-            echo "CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
           fi
           
-          sed -i 's/check_defconfig//' ./common/build.config.gki
-          echo "CONFIG_HEADERS_INSTALL=n" >> ./common/arch/arm64/configs/gki_defconfig
+          sed -i 's/check_defconfig//' ./kernel_platform/common/build.config.gki
+          echo "CONFIG_HEADERS_INSTALL=n" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
           
           echo "✅ 内核配置项添加完成"
+          echo "::endgroup::"
+      
+      - name: 🧩 配置LTO优化
+        run: |
+          cd kernel_workspace
+          echo "::group::配置LTO"
+          
+          DEFCONFIG=./kernel_platform/common/arch/arm64/configs/gki_defconfig
+          
+          # 清理已有 LTO 相关配置，避免重复/冲突
+          sed -i '/^CONFIG_LTO=/d;/^CONFIG_LTO_/d' "$DEFCONFIG"
+          
+          case "${{ github.event.inputs.lto_mode }}" in
+            none)
+              echo "CONFIG_LTO_CLANG_NONE=y" >> "$DEFCONFIG"
+              ;;
+            thin)
+              echo "CONFIG_LTO_CLANG=y" >> "$DEFCONFIG"
+              echo "CONFIG_LTO_CLANG_THIN=y" >> "$DEFCONFIG"
+              ;;
+            full)
+              echo "CONFIG_LTO_CLANG=y" >> "$DEFCONFIG"
+              echo "CONFIG_LTO_CLANG_FULL=y" >> "$DEFCONFIG"
+              ;;
+            *)
+              echo "❌ 未知 LTO 模式: ${{ github.event.inputs.lto_mode }}"
+              exit 1
+              ;;
+          esac
+          
+          echo "✅ LTO配置完成: ${{ github.event.inputs.lto_mode }}"
           echo "::endgroup::"
 
       - name: 🌐 启用网络功能增强
@@ -571,24 +634,24 @@ jobs:
           echo "::group::启用网络功能增强"
           cd kernel_workspace
           
-          echo "CONFIG_BPF_STREAM_PARSER=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_NETFILTER_XT_SET=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_IP_SET=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_IP_SET_MAX=65534" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_BPF_STREAM_PARSER=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_NETFILTER_XT_SET=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP_SET=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP_SET_MAX=65534" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
           
           # IP_SET所有变体
           for config in BITMAP_IP BITMAP_IPMAC BITMAP_PORT \
                         HASH_IP HASH_IPMARK HASH_IPPORT HASH_IPPORTIP HASH_IPPORTNET \
                         HASH_IPMAC HASH_MAC HASH_NETPORTNET HASH_NET HASH_NETNET \
                         HASH_NETPORT HASH_NETIFACE LIST_SET; do
-            echo "CONFIG_IP_SET_$config=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_IP_SET_$config=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
           done
           
-          echo "CONFIG_IP6_NF_NAT=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_IP6_NF_TARGET_MASQUERADE=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP6_NF_NAT=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP6_NF_TARGET_MASQUERADE=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
           
-          cd common
+          cd kernel_platform/common
           wget https://github.com/cctv18/oppo_oplus_realme_sm8750/raw/refs/heads/main/other_patch/config.patch
           patch -p1 -F 3 < config.patch || true
           
@@ -601,19 +664,19 @@ jobs:
             echo "::group::添加BBR等拥塞控制算法"
             cd kernel_workspace
 
-            echo "CONFIG_TCP_CONG_ADVANCED=y" >> ./common/arch/arm64/configs/gki_defconfig
-            echo "CONFIG_TCP_CONG_BBR=y" >> ./common/arch/arm64/configs/gki_defconfig
-            echo "CONFIG_TCP_CONG_CUBIC=y" >> ./common/arch/arm64/configs/gki_defconfig
-            echo "CONFIG_TCP_CONG_VEGAS=y" >> ./common/arch/arm64/configs/gki_defconfig
-            echo "CONFIG_TCP_CONG_NV=y" >> ./common/arch/arm64/configs/gki_defconfig
-            echo "CONFIG_TCP_CONG_WESTWOOD=y" >> ./common/arch/arm64/configs/gki_defconfig
-            echo "CONFIG_TCP_CONG_HTCP=y" >> ./common/arch/arm64/configs/gki_defconfig
-            echo "CONFIG_TCP_CONG_BRUTAL=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_TCP_CONG_ADVANCED=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_TCP_CONG_BBR=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_TCP_CONG_CUBIC=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_TCP_CONG_VEGAS=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_TCP_CONG_NV=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_TCP_CONG_WESTWOOD=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_TCP_CONG_HTCP=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_TCP_CONG_BRUTAL=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
 
             if [[ "${{ github.event.inputs.bbr_enable }}" == "default" ]]; then
-              echo "CONFIG_DEFAULT_TCP_CONG=bbr" >> ./common/arch/arm64/configs/gki_defconfig
+              echo "CONFIG_DEFAULT_TCP_CONG=bbr" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
             else
-              echo "CONFIG_DEFAULT_TCP_CONG=cubic" >> ./common/arch/arm64/configs/gki_defconfig
+              echo "CONFIG_DEFAULT_TCP_CONG=cubic" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
             fi
 
             echo "✅ BBR等拥塞控制算法添加完成"
@@ -626,8 +689,8 @@ jobs:
           echo "::group::启用ADIOS IO调度器"
           cd kernel_workspace
 
-          echo "CONFIG_MQ_IOSCHED_ADIOS=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_MQ_IOSCHED_DEFAULT_ADIOS=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_MQ_IOSCHED_ADIOS=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_MQ_IOSCHED_DEFAULT_ADIOS=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
 
           echo "✅ ADIOS IO调度器启用完成"
           echo "::endgroup::"
@@ -638,7 +701,7 @@ jobs:
           echo "::group::启用Re-Kernel支持"
           cd kernel_workspace
 
-          echo "CONFIG_REKERNEL=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_REKERNEL=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
 
           echo "✅ Re-Kernel支持启用完成"
           echo "::endgroup::"
@@ -649,9 +712,9 @@ jobs:
           echo "::group::启用内核级基带保护"
           cd kernel_workspace
 
-          echo "CONFIG_BBG=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_BBG=y" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
 
-          cd ./common/security
+          cd ./kernel_platform/common/security
           wget https://github.com/cctv18/Baseband-guard/archive/refs/heads/master.zip
           unzip -q master.zip
           mv "Baseband-guard-master" baseband-guard
@@ -694,13 +757,13 @@ jobs:
             SUFFIX="${{ env.KERNEL_NAME }}"
           fi
 
-          for f in ./common/scripts/setlocalversion; do
+          for f in ./kernel_platform/common/scripts/setlocalversion; do
             sed -i "\$s|echo \"\\\$res\"|echo \"-$SUFFIX\"|" "$f"
           done
 
-          sudo sed -i "s/-4k/-$SUFFIX/g" ./common/arch/arm64/configs/gki_defconfig
-          sed -i 's/${scm_version}//' ./common/scripts/setlocalversion
-          echo "CONFIG_LOCALVERSION_AUTO=n" >> ./common/arch/arm64/configs/gki_defconfig
+          sudo sed -i "s/-4k/-$SUFFIX/g" ./kernel_platform/common/arch/arm64/configs/gki_defconfig
+          sed -i 's/${scm_version}//' ./kernel_platform/common/scripts/setlocalversion
+          echo "CONFIG_LOCALVERSION_AUTO=n" >> ./kernel_platform/common/arch/arm64/configs/gki_defconfig
 
           echo "✅ 内核版本后缀设置完成: $SUFFIX"
           echo "::endgroup::"
@@ -731,7 +794,7 @@ jobs:
           export CCACHE_MAXSIZE="2G"
           echo "sloppiness = file_stat_matches,include_file_ctime,include_file_mtime,pch_defines,file_macro,time_macros" >> "$CCACHE_DIR/ccache.conf"
           
-          cd kernel_workspace/common
+          cd kernel_workspace/kernel_platform/common
 
           echo "::group::时间劫持库下载"
           wget https://github.com/cctv18/oppo_oplus_realme_sm8750/raw/refs/heads/main/lib/libfakestat.so
@@ -791,7 +854,7 @@ jobs:
           rm -rf ./AnyKernel3/.git
           cd AnyKernel3
 
-          cp ../common/out/arch/arm64/boot/Image ./Image
+          cp ../kernel_platform/common/out/arch/arm64/boot/Image ./Image
           if [[ ! -f ./Image ]]; then
             echo "❌ 未找到内核镜像文件"
             exit 1
@@ -801,10 +864,6 @@ jobs:
           echo "::group::生成刷机包"
           if [[ "${{ github.event.inputs.ksu_type }}" == "wildksu" ]]; then
             KSU_TYPENAME="Wild_KSU"
-          elif [[ "${{ github.event.inputs.ksu_type }}" == "sukisu" ]]; then
-            KSU_TYPENAME="SukiSU"
-          elif [[ "${{ github.event.inputs.ksu_type }}" == "resukisu" ]]; then
-            KSU_TYPENAME="ReSukiSU"
           elif [[ "${{ github.event.inputs.ksu_type }}" == "ksunext" ]]; then
             KSU_TYPENAME="KSUNext"
           elif [[ "${{ github.event.inputs.ksu_type }}" == "mksu" ]]; then
@@ -942,3 +1001,4 @@ jobs:
               echo "- \`$name\` ($size)" >> $GITHUB_STEP_SUMMARY
             fi
           done
+
